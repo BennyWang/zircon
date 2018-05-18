@@ -7,8 +7,6 @@
 #include <fbl/auto_lock.h>
 #include <string.h>
 
-#include <pretty/hexdump.h>
-
 #include "intel-audio-dsp.h"
 #include "intel-dsp-code-loader.h"
 
@@ -64,6 +62,11 @@ zx_status_t IntelAudioDsp::DriverBind(zx_device_t* hda_dev) {
         return res;
     }
 
+    res = ParseNhlt();
+    if (res != ZX_OK) {
+        return res;
+    }
+
     state_ = State::INITIALIZING;
 
     // Perform hardware initializastion in a thread.
@@ -102,7 +105,7 @@ zx_status_t IntelAudioDsp::SetupDspDevice() {
     size_t bar_size;
     res = ihda_dsp_get_mmio(&ihda_dsp_, bar_vmo.reset_and_get_address(), &bar_size);
     if (res != ZX_OK) {
-        LOG(ERROR, "Failed to fetch DSP register VMO (err %d)\n", res);
+        LOG(ERROR, "Failed to fetch DSP register VMO (err %u)\n", res);
         return res;
     }
 
@@ -160,6 +163,67 @@ zx_status_t IntelAudioDsp::SetupDspDevice() {
     if (res != ZX_OK) {
         LOG(ERROR, "Failed to set DSP interrupt callback (res %d)\n", res);
         return res;
+    }
+
+    return ZX_OK;
+}
+
+zx_status_t IntelAudioDsp::ParseNhlt() {
+    size_t size = 0;
+    zx_status_t res = device_get_metadata(codec_device(), MD_KEY_NHLT,
+                                          nhlt_buf, sizeof(nhlt_buf), &size);
+    if (res != ZX_OK) {
+        LOG(ERROR, "Failed to fetch NHLT (res %d)\n", res);
+        return res;
+    }
+
+    nhlt_table_t* nhlt = reinterpret_cast<nhlt_table_t*>(nhlt_buf);
+
+    // Sanity check
+    if (size < sizeof(*nhlt)) {
+        LOG(ERROR, "NHLT too small (%zu bytes)\n", size);
+        return ZX_ERR_INTERNAL;
+    }
+
+    if (memcmp(nhlt->header.signature, ACPI_NHLT_SIGNATURE, ACPI_NAME_SIZE)) {
+        LOG(ERROR, "Invalid NHLT signature (expected '%s', got '%s')\n",
+                   ACPI_NHLT_SIGNATURE, nhlt->header.signature);
+        return ZX_ERR_INTERNAL;
+    }
+
+    uint8_t count = nhlt->endpoint_desc_count;
+    if (count > I2S_CONFIG_MAX) {
+        LOG(INFO, "Too many NHLT endpoints (max %zu, got %u), "
+                  "only the first %zu will be processed\n",
+                  I2S_CONFIG_MAX, count, I2S_CONFIG_MAX);
+        count = I2S_CONFIG_MAX;
+    }
+
+    // Extract the PCM formats and I2S config blob
+    size_t i = 0;
+    nhlt_descriptor_t* desc = nhlt->endpoints;
+    while (count--) {
+        if (desc->link_type != NHLT_LINK_TYPE_SSP) {
+            continue;
+        }
+
+        const formats_config_t* formats = reinterpret_cast<const formats_config_t*>(
+                reinterpret_cast<uint8_t*>(&desc->config) +
+                                           sizeof(desc->config.capabilities_size) +
+                                           desc->config.capabilities_size
+        );
+        if (formats->format_config_count == 0) {
+            continue;
+        }
+
+        i2s_configs_[i++] = { desc->virtual_bus_id, desc->direction, formats };
+
+        desc = reinterpret_cast<nhlt_descriptor_t*>(
+                reinterpret_cast<uint8_t*>(desc) + desc->length);
+        if ((size_t)(reinterpret_cast<uint8_t*>(desc) - nhlt_buf) > size) {
+            LOG(TRACE, "descriptor at %p out of bounds\n", desc);
+            break;
+        }
     }
 
     return ZX_OK;
